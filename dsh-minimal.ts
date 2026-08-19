@@ -13,8 +13,11 @@
  *    while the real request can unlock every other tool on demand via
  *    tool_grant.
  * The plugin also registers `xd` and `skills` for on-demand capability
- * discovery. Pro mode never injects an extra prime message into the provider
- * payload: the warmup prompt IS the first user message.
+ * discovery. When skills exist, the pro handoff advertises the compact
+ * `tool_grant group skills -> skills list -> skills read` path instead of
+ * dumping the catalog into the system prompt. Pro mode never injects an extra
+ * prime message into the provider payload: the warmup prompt IS the first
+ * user message.
  *
  * DeepSeek V4 Pro subagents (task/executor sessions with a session_init
  * entry) get the same two-stage treatment, initialized from the session_init
@@ -62,6 +65,7 @@ const TOOL_GROUPS: Record<string, string[]> = {
   research: ['web_search'],
   project: ['todo', 'workflow', 'checkpoint', 'rewind', 'goal'],
   browser: ['browser'],
+  skills: ['skills'],
 }
 
 /** Official DSH Minimal persistent-bash JSON schema (transport-neutral). */
@@ -248,6 +252,7 @@ interface Entry {
 interface ToolParams {
   action: 'list' | 'read'
   name?: string
+  query?: string
 }
 
 interface ToolGrantParams {
@@ -272,6 +277,7 @@ interface SessionManager {
 
 interface Ctx {
   sessionManager?: SessionManager
+  cwd?: string
   hasUI?: boolean
   model?: { id?: string; provider?: string; name?: string }
   models?: { current?(): { id?: string; provider?: string; name?: string } | undefined }
@@ -455,6 +461,17 @@ function subagentYieldContract(sessionManager: SessionManager | undefined): stri
   }
   const readOnly = init?.readOnly === true ? ' This agent is read-only: never create or modify files.' : ''
   return `${shape}${readOnly}`
+}
+
+/** On-demand skills onboarding footer. The catalog itself is never dumped:
+ *  the handoff only advertises that skills exist and how to open the compact
+ *  list, preserving the minimal-system / minimal-tool CoT anchor. */
+function skillsFooter(cwd: string | undefined, enabledForSession: boolean): string {
+  if (!enabledForSession || !cwd) return ''
+  let skills: SkillInfo[] = []
+  try { skills = scanSkills(cwd) } catch { return '' }
+  if (skills.length === 0) return ''
+  return `\n\n---\nSkills: ${skills.length} skill${skills.length === 1 ? '' : 's'} installed. If one matches this request, call tool_grant({ group: "skills" }), then skills list, then skills read <name>.`
 }
 
 function isDeepSeekV4Pro(ctx: Ctx | undefined): boolean {
@@ -845,9 +862,16 @@ function applyMode(event: unknown, mode: Mode, proPhase: 'bootstrap' | 'promoted
   applyTools(event, mode, proPhase)
 }
 
-function renderSkillList(skills: SkillInfo[]): string {
-  if (skills.length === 0) return 'No skills found.'
-  return skills.map((s) => `- ${s.name}${s.description ? `: ${s.description}` : ''}`).join('\n')
+function filterSkills(skills: SkillInfo[], query: string | undefined): SkillInfo[] {
+  const needle = typeof query === 'string' ? query.trim().toLowerCase() : ''
+  if (!needle) return skills
+  return skills.filter((skill) => `${skill.name} ${skill.description}`.toLowerCase().includes(needle))
+}
+
+function renderSkillList(skills: SkillInfo[], query?: string): string {
+  const filtered = filterSkills(skills, query)
+  if (filtered.length === 0) return typeof query === 'string' && query.trim() ? `No skills match "${query.trim()}".` : 'No skills found.'
+  return filtered.map((s) => `- ${s.name}${s.description ? `: ${s.description}` : ''}`).join('\n')
 }
 
 function eventToolName(event: unknown): string | undefined {
@@ -951,12 +975,12 @@ export default function (pi: Pi) {
 
   pi.registerTool({
     name: 'skills', label: 'Skills', description: 'List or read available skills.',
-    parameters: pi.zod.object({ action: pi.zod.enum(['list', 'read']), name: pi.zod.string().optional() }),
+    parameters: pi.zod.object({ action: pi.zod.enum(['list', 'read']), name: pi.zod.string().optional(), query: pi.zod.string().optional() }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const skillParams = params as ToolParams
       if (skillParams.action === 'list') {
         const skills = scanSkills(ctx.cwd)
-        return { content: [{ type: 'text', text: renderSkillList(skills) }], details: { skills } }
+        return { content: [{ type: 'text', text: renderSkillList(skills, skillParams.query) }], details: { skills } }
       }
       const skill = scanSkills(ctx.cwd).find((item) => item.name === skillParams.name)
       if (!skill) return { content: [{ type: 'text', text: `No skill named "${skillParams.name ?? ''}".` }], isError: true }
@@ -1101,7 +1125,9 @@ export default function (pi: Pi) {
     // with the cooperative "We need..." frame and carries the assignment text
     // itself (without the harness's "Complete assignment thoroughly" wrapper).
     const subagentContract = subagent ? `\n\n${subagentYieldContract(ctx?.sessionManager)}` : ''
-    const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(prompt)}${subagentContract}` : `${HANDOFF_PREFIX}${prompt}`
+    const skillsAvailable = subagent ? subagentAvailableTools(ctx?.sessionManager).has('skills') : true
+    const skillFooter = skillsFooter(ctx?.cwd, skillsAvailable)
+    const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(prompt)}${subagentContract}${skillFooter}` : `${HANDOFF_PREFIX}${prompt}${skillFooter}`
     const content: unknown[] = [{ type: 'text', text: handoff }]
     if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
     if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
