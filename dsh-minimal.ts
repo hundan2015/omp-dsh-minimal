@@ -466,11 +466,31 @@ function subagentYieldContract(sessionManager: SessionManager | undefined): stri
 /** On-demand skills onboarding footer. The catalog itself is never dumped:
  *  the handoff only advertises that skills exist and how to open the compact
  *  list, preserving the minimal-system / minimal-tool CoT anchor. */
-function skillsFooter(cwd: string | undefined, enabledForSession: boolean): string {
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function referencedSkill(prompt: string | undefined, skills: SkillInfo[]): SkillInfo | undefined {
+  if (!prompt) return undefined
+  const text = prompt.toLowerCase()
+  for (const skill of skills) {
+    const name = skill.name.toLowerCase()
+    if (!name) continue
+    const pattern = new RegExp(`(?<![a-z0-9_-])${escapeRegExp(name)}(?![a-z0-9_-])`)
+    if (pattern.test(text)) return skill
+  }
+  return undefined
+}
+
+function skillsFooter(cwd: string | undefined, enabledForSession: boolean, prompt: string | undefined): string {
   if (!enabledForSession || !cwd) return ''
   let skills: SkillInfo[] = []
   try { skills = scanSkills(cwd) } catch { return '' }
   if (skills.length === 0) return ''
+  const required = referencedSkill(prompt, skills)
+  if (required) {
+    return `\n\n---\nThis request references the "${required.name}" skill.\nWe need to load it first: call tool_grant({ group: "skills" }), then skills read "${required.name}" and follow its protocol.`
+  }
   return `\n\n---\nSkills: ${skills.length} skill${skills.length === 1 ? '' : 's'} installed. If one matches this request, call tool_grant({ group: "skills" }), then skills list, then skills read <name>.`
 }
 
@@ -1126,7 +1146,7 @@ export default function (pi: Pi) {
     // itself (without the harness's "Complete assignment thoroughly" wrapper).
     const subagentContract = subagent ? `\n\n${subagentYieldContract(ctx?.sessionManager)}` : ''
     const skillsAvailable = subagent ? subagentAvailableTools(ctx?.sessionManager).has('skills') : true
-    const skillFooter = skillsFooter(ctx?.cwd, skillsAvailable)
+    const skillFooter = skillsFooter(ctx?.cwd, skillsAvailable, prompt)
     const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(prompt)}${subagentContract}${skillFooter}` : `${HANDOFF_PREFIX}${prompt}${skillFooter}`
     const content: unknown[] = [{ type: 'text', text: handoff }]
     if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
