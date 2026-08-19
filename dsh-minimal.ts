@@ -57,6 +57,19 @@ const SUBAGENT_INIT_ENTRY = 'session_init'
 const SUBAGENT_RESIDENT_CANDIDATES = ['bash', PRO_EDITOR, TOOL_GRANT_NAME, 'yield']
 const SUBAGENT_HANDOFF_BASE = 'We need to handle the following request together.\n\n'
 
+function looksLikeHandoff(text: string): boolean {
+  return typeof text === 'string' && (text.startsWith(HANDOFF_PREFIX) || text.startsWith(SUBAGENT_HANDOFF_BASE))
+}
+
+function stripHandoffFrame(text: string): string {
+  let t = text
+  while (t.startsWith(HANDOFF_PREFIX) || t.startsWith(SUBAGENT_HANDOFF_BASE)) {
+    const prefix = t.startsWith(HANDOFF_PREFIX) ? HANDOFF_PREFIX : SUBAGENT_HANDOFF_BASE
+    t = t.slice(prefix.length).replace(/^\n+/, '')
+  }
+  return t.trim()
+}
+
 /** Predefined groups for tool_grant. */
 const TOOL_GROUPS: Record<string, string[]> = {
   files: ['read', 'write', 'edit', 'glob', 'grep', 'bash', 'str_replace_editor'],
@@ -237,6 +250,7 @@ interface Entry {
     promoteOn?: 'tool-call' | 'assistant-message' | 'either'
     grantedTools?: string[]
     warmupPhase?: 'pending' | 'done'
+    handoffState?: 'queued' | 'sent'
     prompt?: string
   }
   agent?: string
@@ -349,12 +363,18 @@ function hasModeEntry(sessionManager: SessionManager | undefined): boolean {
   return sessionManager?.getBranch().some((entry) => entry.type === 'custom' && entry.customType === STATE_ENTRY) ?? false
 }
 
-function readWarmupState(sessionManager: SessionManager | undefined): { phase?: 'pending' | 'done'; prompt?: string } {
-  let state: { phase?: 'pending' | 'done'; prompt?: string } = {}
+interface WarmupState {
+  phase?: 'pending' | 'done'
+  prompt?: string
+  handoffState?: 'queued' | 'sent'
+}
+
+function readWarmupState(sessionManager: SessionManager | undefined): WarmupState {
+  let state: WarmupState = {}
   for (const entry of sessionManager?.getBranch() ?? []) {
     if (entry.type !== 'custom' || entry.customType !== WARMUP_ENTRY) continue
     if (entry.data?.warmupPhase === 'pending' || entry.data?.warmupPhase === 'done') {
-      state = { phase: entry.data.warmupPhase, prompt: entry.data.prompt }
+      state = { phase: entry.data.warmupPhase, prompt: entry.data.prompt, handoffState: entry.data.handoffState }
     }
   }
   return state
@@ -362,7 +382,13 @@ function readWarmupState(sessionManager: SessionManager | undefined): { phase?: 
 
 function readWarmupPending(sessionManager: SessionManager | undefined): string | undefined {
   const state = readWarmupState(sessionManager)
-  return state.phase === 'pending' && typeof state.prompt === 'string' ? state.prompt : undefined
+  if (state.phase === 'pending') return typeof state.prompt === 'string' ? state.prompt : undefined
+  if (state.phase === 'done' && state.handoffState === 'queued') return typeof state.prompt === 'string' ? state.prompt : undefined
+  return undefined
+}
+
+function warmupHandoffCompleted(state: WarmupState): boolean {
+  return state.phase === 'done' && state.handoffState !== 'queued'
 }
 
 function hasConversationEntries(sessionManager: SessionManager | undefined): boolean {
@@ -1078,6 +1104,7 @@ export default function (pi: Pi) {
   })
 
   let warmupImages: unknown[] | undefined
+  let handoffInFlight = false
 
   function allToolNames(): string[] {
     const all = pi.getAllTools?.() ?? []
@@ -1123,37 +1150,47 @@ export default function (pi: Pi) {
   }
 
   async function finishWarmup(ctx: Ctx | undefined, deliverAs?: 'steer' | 'followUp'): Promise<void> {
+    if (handoffInFlight) return
+    const warmup = readWarmupState(ctx?.sessionManager)
+    if (warmupHandoffCompleted(warmup)) return
     const prompt = readWarmupPending(ctx?.sessionManager)
     if (prompt === undefined) return
     if (readMode(ctx?.sessionManager) !== 'pro') {
-      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
+      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt, handoffState: 'sent' })
       return
     }
-    const subagent = isSubagentSession(ctx?.sessionManager)
-    const resident = subagent ? subagentResidentTools(ctx?.sessionManager) : PRO_RESIDENT_TOOLS
-    // Warmup is complete. Promote to the resident tool set (Minimal pair +
-    // tool_grant, plus yield for subagents) and hand the original prompt over
-    // inside a short cooperative frame. For subagents the harness wrapper
-    // ("Complete assignment thoroughly") is stripped so the frame opens on
-    // the assignment text itself, and the wire transcript is rewritten to
-    // warmup-user -> warmup-assistant -> cooperative handoff.
-    const state = readProState(ctx?.sessionManager)
-    pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: resident, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: [] })
-    pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt })
-    await pi.setActiveTools?.(resident)
-    // Mirror the proven main-agent recipe: the follow-up user message starts
-    // with the cooperative "We need..." frame and carries the assignment text
-    // itself (without the harness's "Complete assignment thoroughly" wrapper).
-    const subagentContract = subagent ? `\n\n${subagentYieldContract(ctx?.sessionManager)}` : ''
-    const skillsAvailable = subagent ? subagentAvailableTools(ctx?.sessionManager).has('skills') : true
-    const skillFooter = skillsFooter(ctx?.cwd, skillsAvailable, prompt)
-    const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(prompt)}${subagentContract}${skillFooter}` : `${HANDOFF_PREFIX}${prompt}${skillFooter}`
-    const content: unknown[] = [{ type: 'text', text: handoff }]
-    if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
-    if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
-    else pi.sendUserMessage?.(content)
-    warmupImages = undefined
-    ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending the assignment with resident tools (${resident.join(', ')})`, 'info')
+    handoffInFlight = true
+    try {
+      const subagent = isSubagentSession(ctx?.sessionManager)
+      const resident = subagent ? subagentResidentTools(ctx?.sessionManager) : PRO_RESIDENT_TOOLS
+      // Warmup is complete. Promote to the resident tool set (Minimal pair +
+      // tool_grant, plus yield for subagents) and hand the original prompt over
+      // inside a short cooperative frame. For subagents the harness wrapper
+      // ("Complete assignment thoroughly") is stripped so the frame opens on
+      // the assignment text itself, and the wire transcript is rewritten to
+      // warmup-user -> warmup-assistant -> cooperative handoff.
+      const state = readProState(ctx?.sessionManager)
+      pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: resident, promoteOn: state.promoteOn ?? 'tool-call', grantedTools: [] })
+      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt, handoffState: 'queued' })
+      await pi.setActiveTools?.(resident)
+      // Mirror the proven main-agent recipe: the follow-up user message starts
+      // with the cooperative "We need..." frame and carries the assignment text
+      // itself (without the harness's "Complete assignment thoroughly" wrapper).
+      const originalPrompt = stripHandoffFrame(prompt)
+      const subagentContract = subagent ? `\n\n${subagentYieldContract(ctx?.sessionManager)}` : ''
+      const skillsAvailable = subagent ? subagentAvailableTools(ctx?.sessionManager).has('skills') : true
+      const skillFooter = skillsFooter(ctx?.cwd, skillsAvailable, originalPrompt)
+      const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(originalPrompt)}${subagentContract}${skillFooter}` : `${HANDOFF_PREFIX}${originalPrompt}${skillFooter}`
+      const content: unknown[] = [{ type: 'text', text: handoff }]
+      if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
+      if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })
+      else pi.sendUserMessage?.(content)
+      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt, handoffState: 'sent' })
+      warmupImages = undefined
+      ctx?.ui?.notify?.(`dsh-minimal pro warmup complete: sending the assignment with resident tools (${resident.join(', ')})`, 'info')
+    } finally {
+      handoffInFlight = false
+    }
   }
 
   pi.on('input', (event, ctx) => {
@@ -1167,6 +1204,17 @@ export default function (pi: Pi) {
     const warmup = readWarmupState(ctx?.sessionManager)
     if (warmup.phase === 'done') return
     if (typeof input.text !== 'string' || input.text.startsWith('/')) return
+    if (looksLikeHandoff(input.text)) {
+      // Tree replay of a handoff message (or a user manually pasting the same
+      // cooperative frame) must not start a second warmup or wrap the frame
+      // again. Promote immediately and treat the text as the real user turn.
+      const resident = isSubagentSession(ctx?.sessionManager)
+        ? subagentResidentTools(ctx?.sessionManager)
+        : PRO_RESIDENT_TOOLS
+      pi.appendEntry(STATE_ENTRY, { mode: 'pro', phase: 'promoted', activeTools: resident, promoteOn: 'tool-call', grantedTools: [] })
+      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', prompt: input.text, handoffState: 'sent' })
+      return
+    }
     if (warmup.phase === 'pending') {
       if (!hasConversationEntries(ctx?.sessionManager)) {
         // Previous warmup never produced a conversation turn; retry with this prompt.
@@ -1174,7 +1222,7 @@ export default function (pi: Pi) {
         return { action: 'transform', text: WARMUP_PROMPT }
       }
       // Stale pending from an interrupted warmup: discard so this prompt is never swallowed.
-      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done' })
+      pi.appendEntry(WARMUP_ENTRY, { warmupPhase: 'done', handoffState: 'sent' })
       ctx?.ui?.notify?.('dsh-minimal pro: discarded stale warmup state', 'warning')
       return
     }
@@ -1249,9 +1297,9 @@ export default function (pi: Pi) {
   pi.on('agent_end', async (_event, ctx) => {
     if (readMode(ctx?.sessionManager) !== 'pro') return
     if (readWarmupPending(ctx?.sessionManager) === undefined) return
-    // The agent loop is still streaming at agent_end, so queue the original
-    // prompt as a follow-up; omp drains it immediately after the warmup run.
-    await finishWarmup(ctx, 'followUp')
+    // Try to send the handoff as a normal user turn (same as a /tree replay).
+    // The lock/state in finishWarmup prevents agent_settled from duplicating it.
+    await finishWarmup(ctx)
   })
 
   pi.on('agent_settled', async (_event, ctx) => {
