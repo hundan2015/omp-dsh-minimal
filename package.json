@@ -1,6 +1,6 @@
 {
   "name": "omp-dsh-minimal",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "DSH-style minimal mode for omp: one-line system prompt + xd capability discovery.",
   "type": "module",
   "license": "MIT",

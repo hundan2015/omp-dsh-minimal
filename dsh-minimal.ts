@@ -520,6 +520,21 @@ function skillsFooter(cwd: string | undefined, enabledForSession: boolean, promp
   return `\n\n---\nSkills: ${skills.length} skill${skills.length === 1 ? '' : 's'} installed. If one matches this request, call tool_grant({ group: "skills" }), then skills list, then skills read <name>.`
 }
 
+/** Pro mode removes AGENTS.md/CLAUDE.md from the native system prompt. When the
+ *  workspace actually contains those context files, add a compact one-line
+ *  instruction to the handoff so the model reads them before starting. */
+function contextFilesInstruction(cwd: string | undefined): string {
+  if (!cwd) return ''
+  const found: string[] = []
+  for (const name of ['AGENTS.md', 'CLAUDE.md']) {
+    try {
+      if (existsSync(join(cwd, name))) found.push(name)
+    } catch { continue }
+  }
+  if (found.length === 0) return ''
+  return `Read ${found.join(' and ')} in the project root before starting.`
+}
+
 function isDeepSeekV4Pro(ctx: Ctx | undefined): boolean {
   const model = ctx?.model ?? ctx?.models?.current?.()
   const haystack = [model?.id, model?.provider, model?.name].filter(Boolean).join(' ').toLowerCase()
@@ -1180,7 +1195,9 @@ export default function (pi: Pi) {
       const subagentContract = subagent ? `\n\n${subagentYieldContract(ctx?.sessionManager)}` : ''
       const skillsAvailable = subagent ? subagentAvailableTools(ctx?.sessionManager).has('skills') : true
       const skillFooter = skillsFooter(ctx?.cwd, skillsAvailable, originalPrompt)
-      const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${subagentAssignmentText(originalPrompt)}${subagentContract}${skillFooter}` : `${HANDOFF_PREFIX}${originalPrompt}${skillFooter}`
+      const contextInstruction = contextFilesInstruction(ctx?.cwd)
+      const contextLead = contextInstruction ? `${contextInstruction}\n\n` : ''
+      const handoff = subagent ? `${subagentHandoffPrefix(ctx?.sessionManager)}${contextLead}${subagentAssignmentText(originalPrompt)}${subagentContract}${skillFooter}` : `${HANDOFF_PREFIX}${contextLead}${originalPrompt}${skillFooter}`
       const content: unknown[] = [{ type: 'text', text: handoff }]
       if (Array.isArray(warmupImages) && warmupImages.length > 0) content.push(...warmupImages)
       if (deliverAs) pi.sendUserMessage?.(content, { deliverAs })

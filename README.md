@@ -38,6 +38,7 @@ A notable signature we observed in DeepSeek CoT traces is a high frequency of **
 - **Skills via `xd://skills`** — no skills injected into the system prompt
 - **Persistent state** — mode survives session restarts
 - **Auto-enable on DeepSeek** — if no manual state has been set and the active model is a DeepSeek model, minimal mode is enabled automatically and a TUI notification explains why
+- **Pro handoff reads project context** — when `AGENTS.md` or `CLAUDE.md` exists in the project root, the pro handoff includes `Read AGENTS.md in the project root before starting.` (or both files) so the model still loads workspace context after the native system prompt is minimized
 - **No runtime dependencies**, no `any`, minimal structural types
 
 ## Installation
